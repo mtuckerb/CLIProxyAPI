@@ -105,22 +105,320 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 }
 
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	if len(h.cfg.APIKeyPolicies) == 0 {
+		c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys})
+		return
+	}
+	c.JSON(200, gin.H{
+		"api-keys":         h.cfg.APIKeys,
+		"api-key-policies": h.cfg.APIKeyPolicies,
+	})
+}
+
+// PutAPIKeys accepts either:
+//
+//	["sk-aaa", "sk-bbb"]                           (legacy plain list)
+//	{"items": ["sk-aaa", "sk-bbb"]}                (legacy wrapped list)
+//	[{"key":"sk-aaa","allowedModels":["gpt-4o*"]}, {"key":"sk-bbb"}]
+//	[{"key":"sk-aaa","allowed-models":["gpt-4o*"]}]
+//
+// The structured form is unwound into APIKeys (the flat list of accepted bearer
+// values, used by the auth provider) plus APIKeyPolicies (the per-key policy
+// rows, consumed by the model-ACL middleware).
 func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	keys, policies, ok := parseAPIKeysPayload(data)
+	if !ok {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.APIKeys = append([]string(nil), keys...)
+	h.cfg.SetAPIKeyPolicies(policies)
+	h.persistLocked(c)
 }
+
+// parseAPIKeysPayload accepts both the legacy plain-string formats and the
+// structured form described on PutAPIKeys. It returns the bearer values, the
+// matching policy entries (only for keys that supplied a non-empty
+// AllowedModels list), and ok=false on parse failure.
+func parseAPIKeysPayload(data []byte) (keys []string, policies []config.APIKeyPolicy, ok bool) {
+	// Try plain []string first.
+	var plain []string
+	if err := json.Unmarshal(data, &plain); err == nil {
+		return dedupeKeyList(plain), nil, true
+	}
+
+	// Try {items: []string}.
+	var wrapped struct {
+		Items []string `json:"items"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil && len(wrapped.Items) > 0 {
+		return dedupeKeyList(wrapped.Items), nil, true
+	}
+
+	// Try the structured form: []{key, allowedModels|allowed-models}.
+	type structuredEntry struct {
+		Key                  string   `json:"key"`
+		AllowedModelsCamel   []string `json:"allowedModels"`
+		AllowedModelsHyphen  []string `json:"allowed-models"`
+		AllowedModelsSnake   []string `json:"allowed_models"`
+	}
+	var entries []structuredEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		// Try {items: [...]} of structured entries.
+		var wrappedStruct struct {
+			Items []structuredEntry `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &wrappedStruct); err2 != nil || len(wrappedStruct.Items) == 0 {
+			return nil, nil, false
+		}
+		entries = wrappedStruct.Items
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry.Key)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+
+		allowed := entry.AllowedModelsCamel
+		if len(allowed) == 0 {
+			allowed = entry.AllowedModelsHyphen
+		}
+		if len(allowed) == 0 {
+			allowed = entry.AllowedModelsSnake
+		}
+		normalized := make([]string, 0, len(allowed))
+		for _, pattern := range allowed {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			normalized = append(normalized, pattern)
+		}
+		if len(normalized) > 0 {
+			policies = append(policies, config.APIKeyPolicy{
+				Key:           key,
+				AllowedModels: normalized,
+			})
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil, false
+	}
+	return keys, policies, true
+}
+
+// apiKeyValuePresent reports whether any entry in keys equals value. Used by
+// PatchAPIKeys and DeleteAPIKeys to decide whether a policy migration/removal
+// would orphan a still-valid duplicate credential.
+func apiKeyValuePresent(keys []string, value string) bool {
+	for _, k := range keys {
+		if k == value {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupeKeyList trims and de-duplicates raw key strings while preserving order.
+func dedupeKeyList(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, raw := range in {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+// PatchAPIKeys mutates the bearer-key list in place (rename via old/new,
+// overwrite via index/value) AND keeps APIKeyPolicies in sync so that renamed
+// keys do not silently shed their model-allowlist (see issue flagged by the
+// Codex review on the prior PR: rotation leaked policy rows and caused new
+// keys to fall back to the default policy). Unknown shapes 400.
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	var body struct {
+		Old   *string `json:"old"`
+		New   *string `json:"new"`
+		Index *int    `json:"index"`
+		Value *string `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	target := &h.cfg.APIKeys
+
+	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
+		prev := (*target)[*body.Index]
+		(*target)[*body.Index] = *body.Value
+		// Indexed patch rewrites exactly one slot. When duplicates of the
+		// previous value remain in APIKeys we must NOT migrate the policy
+		// away from them — doing so would leave the leftover duplicates
+		// unrestricted (falling back to the default allow-all policy).
+		// Only migrate the policy when this was the last slot carrying
+		// prev; in any other case the caller has to set a new policy via
+		// PUT /api-keys explicitly.
+		if !apiKeyValuePresent(*target, prev) {
+			h.renameAPIKeyPolicy(prev, *body.Value)
+		}
+		h.persistLocked(c)
+		return
+	}
+	if body.Old != nil && body.New != nil {
+		renamed := false
+		for i := range *target {
+			if (*target)[i] == *body.Old {
+				(*target)[i] = *body.New
+				renamed = true
+				// No break: rename every duplicate so no "old" slot is
+				// left behind after the policy migrates — a leftover
+				// duplicate would otherwise fall back to the default
+				// policy (usually allow-all) and become less restricted
+				// than intended.
+			}
+		}
+		if renamed {
+			h.renameAPIKeyPolicy(*body.Old, *body.New)
+		} else {
+			*target = append(*target, *body.New)
+			// New key has no prior policy — nothing to rename. The default
+			// policy applies until PUT /api-keys sets an explicit policy.
+		}
+		h.persistLocked(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "missing fields"})
 }
+
+// DeleteAPIKeys removes the bearer key matched by ?index= or ?value= AND
+// drops any APIKeyPolicies entries keyed by the deleted value, so the policy
+// cannot outlive the credential.
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	target := &h.cfg.APIKeys
+
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(*target) {
+			removed := (*target)[idx]
+			*target = append((*target)[:idx], (*target)[idx+1:]...)
+			// Only drop the policy row if no other entries in APIKeys
+			// still carry this value. Otherwise the remaining duplicates
+			// would lose their restriction and fall back to the default
+			// policy (usually allow-all) — broader access than intended.
+			if !apiKeyValuePresent(*target, removed) {
+				h.removeAPIKeyPolicy(removed)
+			}
+			h.persistLocked(c)
+			return
+		}
+	}
+	if val := strings.TrimSpace(c.Query("value")); val != "" {
+		out := make([]string, 0, len(*target))
+		for _, v := range *target {
+			if strings.TrimSpace(v) != val {
+				out = append(out, v)
+			}
+		}
+		*target = out
+		h.removeAPIKeyPolicy(val)
+		h.persistLocked(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "missing index or value"})
+}
+
+// renameAPIKeyPolicy updates the Key field of any APIKeyPolicy whose Key
+// matches oldKey. If newKey already has a policy row we drop the old one
+// (newKey's policy wins — callers should use PUT /api-keys if they want a
+// different merge). Any mutation invalidates the cached lookup map.
+func (h *Handler) renameAPIKeyPolicy(oldKey, newKey string) {
+	oldKey = strings.TrimSpace(oldKey)
+	newKey = strings.TrimSpace(newKey)
+	if oldKey == "" || oldKey == newKey || len(h.cfg.APIKeyPolicies) == 0 {
+		return
+	}
+	hasNew := false
+	for i := range h.cfg.APIKeyPolicies {
+		if h.cfg.APIKeyPolicies[i].Key == newKey {
+			hasNew = true
+			break
+		}
+	}
+	// Allocate a fresh slice rather than reusing h.cfg.APIKeyPolicies' backing
+	// array: SDKConfig.policyIndex caches pointers into that array, and a
+	// concurrent reader resolving the cache mid-write would observe a
+	// partially-mutated entry. A new backing array keeps the old pointers
+	// valid until InvalidatePolicyIndex forces a refresh.
+	out := make([]config.APIKeyPolicy, 0, len(h.cfg.APIKeyPolicies))
+	for i := range h.cfg.APIKeyPolicies {
+		p := h.cfg.APIKeyPolicies[i]
+		if p.Key == oldKey {
+			if hasNew {
+				// Drop the old row entirely.
+				continue
+			}
+			p.Key = newKey
+		}
+		out = append(out, p)
+	}
+	h.cfg.APIKeyPolicies = out
+	h.cfg.InvalidatePolicyIndex()
+}
+
+// removeAPIKeyPolicy drops every APIKeyPolicy row keyed by the given value.
+// The cached lookup map is invalidated.
+func (h *Handler) removeAPIKeyPolicy(key string) {
+	key = strings.TrimSpace(key)
+	if key == "" || len(h.cfg.APIKeyPolicies) == 0 {
+		return
+	}
+	out := make([]config.APIKeyPolicy, 0, len(h.cfg.APIKeyPolicies))
+	for i := range h.cfg.APIKeyPolicies {
+		if h.cfg.APIKeyPolicies[i].Key == key {
+			continue
+		}
+		out = append(out, h.cfg.APIKeyPolicies[i])
+	}
+	if len(out) == 0 {
+		h.cfg.APIKeyPolicies = nil
+	} else {
+		h.cfg.APIKeyPolicies = out
+	}
+	h.cfg.InvalidatePolicyIndex()
 }
 
 // gemini-api-key: []GeminiKey
 func (h *Handler) GetGeminiKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"gemini-api-key": h.cfg.GeminiKey})
+	c.JSON(200, gin.H{"gemini-api-key": h.geminiKeysWithAuthIndex()})
 }
 func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -139,9 +437,11 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
 	h.cfg.SanitizeGeminiKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	type geminiKeyPatch struct {
@@ -161,6 +461,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.GeminiKey) {
 		targetIndex = *body.Index
@@ -187,7 +490,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:targetIndex], h.cfg.GeminiKey[targetIndex+1:]...)
 			h.cfg.SanitizeGeminiKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 		entry.APIKey = trimmed
@@ -209,24 +512,53 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteGeminiKey(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		out := make([]config.GeminiKey, 0, len(h.cfg.GeminiKey))
-		for _, v := range h.cfg.GeminiKey {
-			if v.APIKey != val {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.GeminiKey, 0, len(h.cfg.GeminiKey))
+			for _, v := range h.cfg.GeminiKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			if len(out) != len(h.cfg.GeminiKey) {
+				h.cfg.GeminiKey = out
+				h.cfg.SanitizeGeminiKeys()
+				h.persistLocked(c)
+			} else {
+				c.JSON(404, gin.H{"error": "item not found"})
+			}
+			return
 		}
-		if len(out) != len(h.cfg.GeminiKey) {
-			h.cfg.GeminiKey = out
-			h.cfg.SanitizeGeminiKeys()
-			h.persist(c)
-		} else {
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.GeminiKey {
+			if strings.TrimSpace(h.cfg.GeminiKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount == 0 {
 			c.JSON(404, gin.H{"error": "item not found"})
+			return
 		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		h.cfg.GeminiKey = append(h.cfg.GeminiKey[:matchIndex], h.cfg.GeminiKey[matchIndex+1:]...)
+		h.cfg.SanitizeGeminiKeys()
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -234,7 +566,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(h.cfg.GeminiKey) {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:idx], h.cfg.GeminiKey[idx+1:]...)
 			h.cfg.SanitizeGeminiKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}
@@ -243,7 +575,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 
 // claude-api-key: []ClaudeKey
 func (h *Handler) GetClaudeKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"claude-api-key": h.cfg.ClaudeKey})
+	c.JSON(200, gin.H{"claude-api-key": h.claudeKeysWithAuthIndex()})
 }
 func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -265,9 +597,11 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	for i := range arr {
 		normalizeClaudeKey(&arr[i])
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.ClaudeKey = arr
 	h.cfg.SanitizeClaudeKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
@@ -288,6 +622,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.ClaudeKey) {
 		targetIndex = *body.Index
@@ -331,20 +668,47 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	normalizeClaudeKey(&entry)
 	h.cfg.ClaudeKey[targetIndex] = entry
 	h.cfg.SanitizeClaudeKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteClaudeKey(c *gin.Context) {
-	if val := c.Query("api-key"); val != "" {
-		out := make([]config.ClaudeKey, 0, len(h.cfg.ClaudeKey))
-		for _, v := range h.cfg.ClaudeKey {
-			if v.APIKey != val {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.ClaudeKey, 0, len(h.cfg.ClaudeKey))
+			for _, v := range h.cfg.ClaudeKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.ClaudeKey = out
+			h.cfg.SanitizeClaudeKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.ClaudeKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.ClaudeKey {
+			if strings.TrimSpace(h.cfg.ClaudeKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:matchIndex], h.cfg.ClaudeKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeClaudeKeys()
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -353,7 +717,7 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.ClaudeKey) {
 			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:idx], h.cfg.ClaudeKey[idx+1:]...)
 			h.cfg.SanitizeClaudeKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}
@@ -362,7 +726,7 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 
 // openai-compatibility: []OpenAICompatibility
 func (h *Handler) GetOpenAICompat(c *gin.Context) {
-	c.JSON(200, gin.H{"openai-compatibility": normalizedOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)})
+	c.JSON(200, gin.H{"openai-compatibility": h.openAICompatibilityWithAuthIndex()})
 }
 func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -388,14 +752,17 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 			filtered = append(filtered, arr[i])
 		}
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.OpenAICompatibility = filtered
 	h.cfg.SanitizeOpenAICompatibility()
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
 		Name          *string                             `json:"name"`
 		Prefix        *string                             `json:"prefix"`
+		Disabled      *bool                               `json:"disabled"`
 		BaseURL       *string                             `json:"base-url"`
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
 		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
@@ -410,6 +777,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
 		targetIndex = *body.Index
@@ -435,12 +805,15 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
 	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
+	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -457,10 +830,12 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	normalizeOpenAICompatibilityEntry(&entry)
 	h.cfg.OpenAICompatibility[targetIndex] = entry
 	h.cfg.SanitizeOpenAICompatibility()
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if name := c.Query("name"); name != "" {
 		out := make([]config.OpenAICompatibility, 0, len(h.cfg.OpenAICompatibility))
 		for _, v := range h.cfg.OpenAICompatibility {
@@ -470,7 +845,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		}
 		h.cfg.OpenAICompatibility = out
 		h.cfg.SanitizeOpenAICompatibility()
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -479,7 +854,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.OpenAICompatibility) {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:idx], h.cfg.OpenAICompatibility[idx+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}
@@ -488,7 +863,7 @@ func (h *Handler) DeleteOpenAICompat(c *gin.Context) {
 
 // vertex-api-key: []VertexCompatKey
 func (h *Handler) GetVertexCompatKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"vertex-api-key": h.cfg.VertexCompatAPIKey})
+	c.JSON(200, gin.H{"vertex-api-key": h.vertexCompatKeysWithAuthIndex()})
 }
 func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -514,9 +889,11 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 			return
 		}
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
 	h.cfg.SanitizeVertexCompatKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	type vertexCompatPatch struct {
@@ -537,6 +914,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.VertexCompatAPIKey) {
 		targetIndex = *body.Index
@@ -563,7 +943,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 		entry.APIKey = trimmed
@@ -576,7 +956,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:targetIndex], h.cfg.VertexCompatAPIKey[targetIndex+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -596,20 +976,47 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	normalizeVertexCompatKey(&entry)
 	h.cfg.VertexCompatAPIKey[targetIndex] = entry
 	h.cfg.SanitizeVertexCompatKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
-		for _, v := range h.cfg.VertexCompatAPIKey {
-			if v.APIKey != val {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
+			for _, v := range h.cfg.VertexCompatAPIKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.VertexCompatAPIKey = out
+			h.cfg.SanitizeVertexCompatKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.VertexCompatAPIKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.VertexCompatAPIKey {
+			if strings.TrimSpace(h.cfg.VertexCompatAPIKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:matchIndex], h.cfg.VertexCompatAPIKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeVertexCompatKeys()
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -618,7 +1025,7 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 		if errScan == nil && idx >= 0 && idx < len(h.cfg.VertexCompatAPIKey) {
 			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:idx], h.cfg.VertexCompatAPIKey[idx+1:]...)
 			h.cfg.SanitizeVertexCompatKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}
@@ -809,7 +1216,7 @@ func (h *Handler) DeleteOAuthModelAlias(c *gin.Context) {
 
 // codex-api-key: []CodexKey
 func (h *Handler) GetCodexKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"codex-api-key": h.cfg.CodexKey})
+	c.JSON(200, gin.H{"codex-api-key": h.codexKeysWithAuthIndex()})
 }
 func (h *Handler) PutCodexKeys(c *gin.Context) {
 	data, err := c.GetRawData()
@@ -838,9 +1245,11 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 		}
 		filtered = append(filtered, entry)
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.cfg.CodexKey = filtered
 	h.cfg.SanitizeCodexKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
 	type codexKeyPatch struct {
@@ -861,6 +1270,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	targetIndex := -1
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.CodexKey) {
 		targetIndex = *body.Index
@@ -891,7 +1303,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		if trimmed == "" {
 			h.cfg.CodexKey = append(h.cfg.CodexKey[:targetIndex], h.cfg.CodexKey[targetIndex+1:]...)
 			h.cfg.SanitizeCodexKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -911,20 +1323,47 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	normalizeCodexKey(&entry)
 	h.cfg.CodexKey[targetIndex] = entry
 	h.cfg.SanitizeCodexKeys()
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) DeleteCodexKey(c *gin.Context) {
-	if val := c.Query("api-key"); val != "" {
-		out := make([]config.CodexKey, 0, len(h.cfg.CodexKey))
-		for _, v := range h.cfg.CodexKey {
-			if v.APIKey != val {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.CodexKey, 0, len(h.cfg.CodexKey))
+			for _, v := range h.cfg.CodexKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.CodexKey = out
+			h.cfg.SanitizeCodexKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.CodexKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.CodexKey {
+			if strings.TrimSpace(h.cfg.CodexKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.CodexKey = append(h.cfg.CodexKey[:matchIndex], h.cfg.CodexKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeCodexKeys()
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -933,7 +1372,7 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.CodexKey) {
 			h.cfg.CodexKey = append(h.cfg.CodexKey[:idx], h.cfg.CodexKey[idx+1:]...)
 			h.cfg.SanitizeCodexKeys()
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}

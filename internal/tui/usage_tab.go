@@ -154,11 +154,12 @@ func (m usageTabModel) renderContent() string {
 	))
 
 	// RPM
+	requestsByHour := hourlyStatsFromUsage(usageMap, "requests_by_hour", "total_requests")
+	tokensByHour := hourlyStatsFromUsage(usageMap, "tokens_by_hour", "total_tokens")
+
 	rpm := float64(0)
-	if totalReqs > 0 {
-		if rByH, ok := usageMap["requests_by_hour"].(map[string]any); ok && len(rByH) > 0 {
-			rpm = float64(totalReqs) / float64(len(rByH)) / 60.0
-		}
+	if totalReqs > 0 && len(requestsByHour) > 0 {
+		rpm = float64(totalReqs) / float64(len(requestsByHour)) / 60.0
 	}
 	card3 := cardStyle.Copy().BorderForeground(lipgloss.Color("76")).Render(fmt.Sprintf(
 		"%s\n%s\n%s",
@@ -169,10 +170,8 @@ func (m usageTabModel) renderContent() string {
 
 	// TPM
 	tpm := float64(0)
-	if totalTokens > 0 {
-		if tByH, ok := usageMap["tokens_by_hour"].(map[string]any); ok && len(tByH) > 0 {
-			tpm = float64(totalTokens) / float64(len(tByH)) / 60.0
-		}
+	if totalTokens > 0 && len(tokensByHour) > 0 {
+		tpm = float64(totalTokens) / float64(len(tokensByHour)) / 60.0
 	}
 	card4 := cardStyle.Copy().BorderForeground(lipgloss.Color("170")).Render(fmt.Sprintf(
 		"%s\n%s\n%s",
@@ -185,22 +184,22 @@ func (m usageTabModel) renderContent() string {
 	sb.WriteString("\n\n")
 
 	// ━━━ Requests by Hour (ASCII bar chart) ━━━
-	if rByH, ok := usageMap["requests_by_hour"].(map[string]any); ok && len(rByH) > 0 {
+	if len(requestsByHour) > 0 {
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorHighlight).Render(T("usage_req_by_hour")))
 		sb.WriteString("\n")
 		sb.WriteString(strings.Repeat("─", minInt(m.width, 60)))
 		sb.WriteString("\n")
-		sb.WriteString(renderBarChart(rByH, m.width-6, lipgloss.Color("111")))
+		sb.WriteString(renderBarChart(requestsByHour, m.width-6, lipgloss.Color("111")))
 		sb.WriteString("\n")
 	}
 
 	// ━━━ Tokens by Hour ━━━
-	if tByH, ok := usageMap["tokens_by_hour"].(map[string]any); ok && len(tByH) > 0 {
+	if len(tokensByHour) > 0 {
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorHighlight).Render(T("usage_tok_by_hour")))
 		sb.WriteString("\n")
 		sb.WriteString(strings.Repeat("─", minInt(m.width, 60)))
 		sb.WriteString("\n")
-		sb.WriteString(renderBarChart(tByH, m.width-6, lipgloss.Color("214")))
+		sb.WriteString(renderBarChart(tokensByHour, m.width-6, lipgloss.Color("214")))
 		sb.WriteString("\n")
 	}
 
@@ -360,6 +359,75 @@ func (m usageTabModel) renderLatencyBreakdown(modelStats map[string]any) string 
 	return fmt.Sprintf("    │  %s: avg %dms  min %dms  max %dms\n",
 		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_time")),
 		avgLatency, minLatency, maxLatency)
+}
+
+func hourlyStatsFromUsage(usageMap map[string]any, field, totalField string) map[string]any {
+	if byHour, ok := usageMap[field].(map[string]any); ok && len(byHour) > 0 {
+		return byHour
+	}
+	rebuilt := rebuildHourlyStatsFromDetails(usageMap, totalField)
+	if len(rebuilt) == 0 {
+		return nil
+	}
+	return rebuilt
+}
+
+func rebuildHourlyStatsFromDetails(usageMap map[string]any, totalField string) map[string]any {
+	apis, ok := usageMap["apis"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any)
+	for _, apiSnap := range apis {
+		apiMap, ok := apiSnap.(map[string]any)
+		if !ok {
+			continue
+		}
+		models, ok := apiMap["models"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, modelSnap := range models {
+			modelMap, ok := modelSnap.(map[string]any)
+			if !ok {
+				continue
+			}
+			details, ok := modelMap["details"].([]any)
+			if !ok {
+				continue
+			}
+			for _, detail := range details {
+				detailMap, ok := detail.(map[string]any)
+				if !ok {
+					continue
+				}
+				hour := hourLabelFromTimestamp(getString(detailMap, "timestamp"))
+				if hour == "" {
+					continue
+				}
+				value := float64(1)
+				if totalField == "total_tokens" {
+					value = 0
+					if tokens, ok := detailMap["tokens"].(map[string]any); ok {
+						value = getFloat(tokens, "total_tokens")
+					}
+				}
+				out[hour] = getFloat(out, hour) + value
+			}
+		}
+	}
+	return out
+}
+
+func hourLabelFromTimestamp(timestamp string) string {
+	if len(timestamp) < 13 {
+		return ""
+	}
+	hour := timestamp[11:13]
+	if hour[0] < '0' || hour[0] > '9' || hour[1] < '0' || hour[1] > '9' {
+		return ""
+	}
+	return hour
 }
 
 // renderBarChart renders a simple ASCII horizontal bar chart.
